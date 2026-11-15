@@ -1,0 +1,124 @@
+{
+    "M1":  {
+               "status":  "ACTIVE",
+               "description":  "Bazowy profil kontroli technicznej M1. Kryteria mechaniczne; decyzja końcowa należy do prowadzącego.",
+               "branches":  [
+                                "develop",
+                                "dev",
+                                "main"
+                            ],
+               "requiredDirectories":  [
+                                           "database",
+                                           "scripts",
+                                           "src",
+                                           "tests"
+                                       ],
+               "requiredFiles":  [
+                                     ".env.example",
+                                     ".gitignore",
+                                     "jsconfig.json",
+                                     "package.json",
+                                     "package-lock.json"
+                                 ],
+               "forbiddenTrackedPatterns":  [
+                                                ".env",
+                                                ".env.local",
+                                                "node_modules/"
+                                            ],
+               "advisoryGitignorePatterns":  [
+                                                 "node_modules",
+                                                 ".env"
+                                             ],
+               "evidence":  {
+                                "minSqlFilesInDatabase":  1,
+                                "minFilesInSrc":  1,
+                                "minFilesInTests":  1
+                            }
+           },
+    "M2":  {
+               "status":  "ACTIVE",
+               "description":  "Profil kontroli technicznej M2: warstwa HTTP/API, integracja z bazą danych, bezpieczeństwo konfiguracji i testowalność.",
+               "branches":  [
+                                "develop",
+                                "dev",
+                                "main"
+                            ],
+               "requiredFiles":  [
+                                     ".env.example",
+                                     ".gitignore",
+                                     "package.json",
+                                     "package-lock.json"
+                                 ],
+               "forbiddenTrackedPatterns":  [
+                                                ".env",
+                                                ".env.local",
+                                                "node_modules/"
+                                            ],
+               "advisoryGitignorePatterns":  [
+                                                 "node_modules",
+                                                 ".env"
+                                             ],
+               "evidence":  {
+                                "requireApiImplementation":  true,
+                                "requireHealthEndpoint":  true,
+                                "requireCarsEndpoint":  true,
+                                "requireDatabaseIntegration":  true,
+                                "requireTests":  true
+                            }
+           },
+    "TB":  {
+               "status":  "ACTIVE",
+               "description":  "Technologie backendowe: backend, integracja uslug, kontrakt HTTP, Postman i audyt GitHub.",
+               "branches":  [
+                                "main",
+                                "develop",
+                                "dev"
+                            ],
+               "requiredFiles":  [
+                                     ".env.example",
+                                     "package.json",
+                                     "README_AUDIT.md"
+                                 ],
+               "forbiddenTrackedPatterns":  [
+                                                ".env",
+                                                ".env.local",
+                                                "node_modules/"
+                                            ],
+               "evidence":  {
+                                "requireBackendImplementation":  true,
+                                "requireHttpContract":  true,
+                                "requireExternalServiceIntegration":  true,
+                                "requirePostmanEvidence":  false,
+                                "requireAuditReadme":  true,
+                                "requireTests":  true
+                            }
+           },
+    "ZPWC":  {
+                 "status":  "ACTIVE",
+                 "description":  "Zaawansowane programowanie w chmurze: serverless, service-to-service, deployment, monitoring i CI/CD.",
+                 "branches":  [
+                                  "main",
+                                  "develop",
+                                  "dev"
+                              ],
+                 "requiredFiles":  [
+                                       ".env.example",
+                                       "package.json",
+                                       "README_AUDIT.md"
+                                   ],
+                 "forbiddenTrackedPatterns":  [
+                                                  ".env",
+                                                  ".env.local",
+                                                  "node_modules/"
+                                              ],
+                 "evidence":  {
+                                  "requireServerlessImplementation":  true,
+                                  "requireServiceToService":  true,
+                                  "requireDeploymentUrl":  true,
+                                  "requirePostmanEvidence":  true,
+                                  "requireObservabilityEvidence":  true,
+                                  "requireCicdEvidence":  true,
+                                  "requireTests":  true
+                              }
+             }
+}

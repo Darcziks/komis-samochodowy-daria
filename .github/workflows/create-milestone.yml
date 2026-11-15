@@ -1,0 +1,201 @@
+name: Create milestone from instructor file
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/milestones/M*.md'
+  workflow_dispatch:
+    inputs:
+      milestone:
+        description: 'Milestone ID or file path, for example M2'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out instructor-provided milestone files
+        uses: actions/checkout@v4
+
+      - name: Validate and publish milestone Issue
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_MILESTONE: ${{ inputs.milestone }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const org = context.repo.owner;
+            const repo = context.repo.repo;
+            const sourceDir = path.join(process.env.GITHUB_WORKSPACE, '.github', 'milestones');
+            const requestedMilestone = process.env.REQUESTED_MILESTONE?.trim();
+
+            if (context.ref !== 'refs/heads/main') {
+              throw new Error('Milestones can only be published from the main branch.');
+            }
+
+            let files;
+            if (context.eventName === 'workflow_dispatch') {
+              if (!requestedMilestone) {
+                throw new Error('Provide a milestone ID such as M2.');
+              }
+              const fileName = /^M\d+\.md$/i.test(requestedMilestone)
+                ? requestedMilestone
+                : `${requestedMilestone}.md`;
+              if (!/^M\d+\.md$/i.test(fileName)) {
+                throw new Error('Milestone input must be an ID such as M2 or a filename such as M2.md.');
+              }
+              files = [path.join('.github', 'milestones', fileName)];
+            } else {
+              const changedFiles = (context.payload.commits || []).flatMap(commit => [
+                ...(commit.added || []),
+                ...(commit.modified || [])
+              ]);
+              files = [...new Set(changedFiles.filter(file =>
+                /^\.github\/milestones\/M\d+\.md$/i.test(file)
+              ))];
+              if (files.length === 0) {
+                core.info('No added or modified milestone files were found in this push.');
+                return;
+              }
+            }
+
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: org,
+              repo,
+              state: 'all',
+              per_page: 100
+            });
+            const validatedMilestones = [];
+
+            for (const file of files) {
+              const absolutePath = path.resolve(process.env.GITHUB_WORKSPACE, file);
+              if (!absolutePath.startsWith(`${sourceDir}${path.sep}`) || !fs.existsSync(absolutePath)) {
+                throw new Error(`Milestone source file does not exist: ${file}`);
+              }
+
+              const milestoneMatch = path.basename(file).match(/^(M\d+)\.md$/i);
+              if (!milestoneMatch) {
+                throw new Error(`Invalid milestone filename: ${file}. Expected M<number>.md.`);
+              }
+              const milestone = milestoneMatch[1].toUpperCase();
+              const source = fs.readFileSync(absolutePath, 'utf8');
+              const sourceForValidation = source.replace(/^\uFEFF/, '');
+              const titleMatch = sourceForValidation.match(/^[ \t]*#\s+(M\d+)\s+[—-]\s+(.+?)[ \t]*$/m);
+              if (!titleMatch || titleMatch[1].toUpperCase() !== milestone) {
+                throw new Error(
+                  `${file} must contain a Markdown title "# ${milestone} — Title" matching its filename.`
+                );
+              }
+
+              const deadlineMatches = [...sourceForValidation.matchAll(/^[ \t]*Termin:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$/gm)];
+              if (deadlineMatches.length !== 1) {
+                throw new Error(`${file} must contain exactly one line "Termin: YYYY-MM-DD".`);
+              }
+              const deadline = deadlineMatches[0][1];
+              const deadlineTimestamp = Date.parse(`${deadline}T00:00:00Z`);
+              if (!Number.isFinite(deadlineTimestamp) ||
+                  new Date(deadlineTimestamp).toISOString().slice(0, 10) !== deadline) {
+                throw new Error(`${file} contains an invalid deadline "${deadline}".`);
+              }
+              if (!sourceForValidation.replace(titleMatch[0], '').replace(deadlineMatches[0][0], '').trim()) {
+                throw new Error(`${file} has no task content beyond its title and deadline.`);
+              }
+
+              if (validatedMilestones.some(item => item.milestone === milestone)) {
+                throw new Error(`More than one source file for ${milestone} was selected.`);
+              }
+
+              validatedMilestones.push({ file, milestone, source, titleMatch });
+            }
+
+            const publishableMilestones = validatedMilestones.filter(item => {
+              const existing = allIssues.find(issue =>
+                !issue.pull_request &&
+                new RegExp(`^${item.milestone}(?:\\s|[—-]|$)`, 'i').test(issue.title)
+              );
+              if (existing) {
+                core.warning(
+                  `${item.milestone} was not published because Issue #${existing.number} already exists: ${existing.html_url}`
+                );
+                core.summary
+                  .addHeading(`${item.milestone}: Issue already exists`)
+                  .addLink(existing.title, existing.html_url)
+                  .addEOL();
+                return false;
+              }
+              return true;
+            });
+
+            if (publishableMilestones.length === 0) {
+              await core.summary.write();
+              core.info('No new milestone Issues were created.');
+              return;
+            }
+
+            const rosterPath = path.join(process.env.GITHUB_WORKSPACE, '.github', 'atins-roster.json');
+            let rosterData;
+            try {
+              const rosterContents = fs.readFileSync(rosterPath, 'utf8').replace(/^\uFEFF/, '');
+              rosterData = JSON.parse(rosterContents);
+            } catch (error) {
+              throw new Error(`Could not read or parse ${rosterPath}: ${error.message}`);
+            }
+            if (!rosterData || typeof rosterData !== 'object' || Array.isArray(rosterData)) {
+              throw new Error('.github/atins-roster.json must contain a JSON object.');
+            }
+            if (typeof rosterData.instructor !== 'string' || !rosterData.instructor.trim()) {
+              throw new Error('.github/atins-roster.json must define a non-empty "instructor" login.');
+            }
+            if (!Array.isArray(rosterData.students) || rosterData.students.length === 0) {
+              throw new Error('.github/atins-roster.json must define a non-empty "students" array.');
+            }
+
+            const instructorLogin = rosterData.instructor.trim();
+            const studentLogins = [];
+            const seenStudents = new Set();
+            for (const value of rosterData.students) {
+              if (value == null || (typeof value === 'string' && !value.trim())) {
+                continue;
+              }
+              if (typeof value !== 'string') {
+                throw new Error('Every non-empty entry in roster "students" must be a GitHub login string.');
+              }
+              const login = value.trim();
+              const normalizedLogin = login.toLowerCase();
+              if (normalizedLogin === instructorLogin.toLowerCase() || seenStudents.has(normalizedLogin)) {
+                continue;
+              }
+              seenStudents.add(normalizedLogin);
+              studentLogins.push(login);
+            }
+            if (studentLogins.length === 0) {
+              throw new Error('Roster "students" has no student logins after removing empty values and instructor.');
+            }
+            const roster = new Set(studentLogins);
+
+            for (const item of publishableMilestones) {
+              const title = item.titleMatch[0].replace(/^[ \t]*#\s+/, '').trim();
+              const mentions = [...roster].sort((a, b) => a.localeCompare(b)).map(login => `@${login}`).join(' ');
+              const body = `${mentions}\n\n${item.source}`;
+              const result = await github.rest.issues.create({
+                owner: org,
+                repo,
+                title,
+                body
+              });
+              allIssues.push(result.data);
+              core.notice(`Published ${item.milestone} as Issue #${result.data.number}: ${result.data.html_url}`);
+              await core.summary
+                .addHeading(`${item.milestone}: published`)
+                .addLink(result.data.title, result.data.html_url)
+                .addEOL()
+                .write();
+            }

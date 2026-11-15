@@ -1,0 +1,751 @@
+name: Milestone reminders
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report planned reminders; do not post comments'
+        required: true
+        type: boolean
+        default: true
+
+      reference_date:
+        description: 'Optional UTC date override for testing (YYYY-MM-DD)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+
+  # ==========================================================
+  # JOB 1 — sprawdzenie terminów i ewentualne przypomnienia
+  # ==========================================================
+
+  remind:
+    name: Sprawdzenie i przypomnienia
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check milestone deadlines and remind students
+        id: reminder
+        uses: actions/github-script@v7
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          REFERENCE_DATE: ${{ inputs.reference_date }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const org = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const dryRun = process.env.DRY_RUN === 'true';
+
+            const referenceDate =
+              process.env.REFERENCE_DATE ||
+              new Date().toISOString().slice(0, 10);
+
+            // ------------------------------------------------
+            // ROSTER
+            // ------------------------------------------------
+
+            const rosterPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              '.github',
+              'atins-roster.json'
+            );
+
+            let rosterData;
+
+            try {
+
+              const rosterContents = fs
+                .readFileSync(rosterPath, 'utf8')
+                .replace(/^\uFEFF/, '');
+
+              rosterData = JSON.parse(rosterContents);
+
+            } catch (error) {
+
+              throw new Error(
+                `Could not read or parse ${rosterPath}: ${error.message}`
+              );
+            }
+
+            if (
+              !rosterData ||
+              typeof rosterData !== 'object' ||
+              Array.isArray(rosterData)
+            ) {
+              throw new Error(
+                '.github/atins-roster.json must contain a JSON object.'
+              );
+            }
+
+            if (
+              typeof rosterData.instructor !== 'string' ||
+              !rosterData.instructor.trim()
+            ) {
+              throw new Error(
+                '.github/atins-roster.json must define a non-empty "instructor" login.'
+              );
+            }
+
+            if (
+              !Array.isArray(rosterData.students) ||
+              rosterData.students.length === 0
+            ) {
+              throw new Error(
+                '.github/atins-roster.json must define a non-empty "students" array.'
+              );
+            }
+
+            const instructorLogin =
+              rosterData.instructor.trim();
+
+            const studentLogins = [];
+
+            const seenStudents = new Set();
+
+            for (const value of rosterData.students) {
+
+              if (
+                value == null ||
+                (
+                  typeof value === 'string' &&
+                  !value.trim()
+                )
+              ) {
+                continue;
+              }
+
+              if (typeof value !== 'string') {
+
+                throw new Error(
+                  'Every non-empty entry in roster "students" must be a GitHub login string.'
+                );
+              }
+
+              const login = value.trim();
+
+              const normalizedLogin =
+                login.toLowerCase();
+
+              if (
+                normalizedLogin ===
+                instructorLogin.toLowerCase()
+              ) {
+                continue;
+              }
+
+              if (seenStudents.has(normalizedLogin)) {
+                continue;
+              }
+
+              seenStudents.add(normalizedLogin);
+
+              studentLogins.push(login);
+            }
+
+            if (studentLogins.length === 0) {
+
+              throw new Error(
+                'Roster "students" has no student logins after validation.'
+              );
+            }
+
+            // Mapowanie case-insensitive:
+            // lowercase login -> oryginalny login
+
+            const rosterMap = new Map(
+              studentLogins.map(login => [
+                login.toLowerCase(),
+                login
+              ])
+            );
+
+            const roster = new Set(
+              studentLogins.map(login =>
+                login.toLowerCase()
+              )
+            );
+
+            // ------------------------------------------------
+            // DATA REFERENCYJNA
+            // ------------------------------------------------
+
+            if (
+              !/^\d{4}-\d{2}-\d{2}$/.test(referenceDate) ||
+              new Date(
+                `${referenceDate}T00:00:00Z`
+              ).toISOString().slice(0, 10) !== referenceDate
+            ) {
+
+              throw new Error(
+                `Invalid reference_date "${referenceDate}". Expected YYYY-MM-DD.`
+              );
+            }
+
+            const dateOffset = (date, days) =>
+
+              new Date(
+                Date.parse(`${date}T00:00:00Z`) +
+                days * 24 * 60 * 60 * 1000
+              )
+                .toISOString()
+                .slice(0, 10);
+
+            // ------------------------------------------------
+            // ISSUE
+            // ------------------------------------------------
+
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: org,
+                repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            const milestoneIssues =
+              openIssues.filter(
+                issue =>
+                  !issue.pull_request &&
+                  /^M\d+/i.test(issue.title)
+              );
+
+            // ------------------------------------------------
+            // PODSUMOWANIE DLA DRUGIEGO JOBA
+            // ------------------------------------------------
+
+            const auditSummary = {
+              reference_date: referenceDate,
+              dry_run: dryRun,
+              roster_size: studentLogins.length,
+              issues_checked: milestoneIssues.length,
+              reminders: []
+            };
+
+            for (const issue of milestoneIssues) {
+
+              const milestoneMatch =
+                issue.title.match(/^(M\d+)/i);
+
+              if (!milestoneMatch) {
+                continue;
+              }
+
+              const milestone =
+                milestoneMatch[1].toUpperCase();
+
+              const deadlineMatch =
+                issue.body?.match(
+                  /^\s*Termin:\s*(\d{4}-\d{2}-\d{2})\s*$/im
+                );
+
+              if (!deadlineMatch) {
+
+                core.warning(
+                  `Issue #${issue.number} (${issue.title}) has no "Termin: YYYY-MM-DD" line; skipped.`
+                );
+
+                continue;
+              }
+
+              const deadline =
+                deadlineMatch[1];
+
+              const deadlineTimestamp =
+                Date.parse(
+                  `${deadline}T00:00:00Z`
+                );
+
+              if (
+                !Number.isFinite(deadlineTimestamp) ||
+                new Date(deadlineTimestamp)
+                  .toISOString()
+                  .slice(0, 10) !== deadline
+              ) {
+
+                core.warning(
+                  `Issue #${issue.number} has invalid deadline "${deadline}"; skipped.`
+                );
+
+                continue;
+              }
+
+              // ----------------------------------------------
+              // KOMENTARZE
+              // ----------------------------------------------
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner: org,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100
+                }
+              );
+
+              const submissionPattern =
+                new RegExp(
+                  `\\b${milestone}\\s*[—-]\\s*(?:oddane do weryfikacji|aktualny stan pracy przesłany)\\b`,
+                  'i'
+                );
+
+              // case-insensitive
+
+              const submitted = new Set(
+                comments
+                  .filter(comment => {
+
+                    const login =
+                      comment.user?.login;
+
+                    if (!login) {
+                      return false;
+                    }
+
+                    return (
+                      roster.has(
+                        login.toLowerCase()
+                      ) &&
+                      submissionPattern.test(
+                        comment.body || ''
+                      )
+                    );
+                  })
+                  .map(comment =>
+                    comment.user.login.toLowerCase()
+                  )
+              );
+
+              const pending =
+                studentLogins.filter(
+                  login =>
+                    !submitted.has(
+                      login.toLowerCase()
+                    )
+                );
+
+              if (pending.length === 0) {
+
+                core.info(
+                  `Issue #${issue.number}: all roster members have formal submission comments.`
+                );
+
+                continue;
+              }
+
+              // ----------------------------------------------
+              // CZY DZISIAJ WYSYŁAMY?
+              // ----------------------------------------------
+
+              let reminderType = '';
+              let markerType = '';
+              let message = '';
+
+              if (
+                referenceDate ===
+                dateOffset(deadline, -3)
+              ) {
+
+                reminderType =
+                  '3 dni przed terminem';
+
+                markerType =
+                  'BEFORE-3';
+
+                message =
+                  `Przypomnienie: termin kamienia milowego **${milestone} — ${issue.title.replace(/^M\d+\s*[—-]\s*/, '')}** upływa ${deadline}. ` +
+                  'GitHub nie zawiera jeszcze formalnego zgłoszenia od oznaczonych osób. ' +
+                  `Zgłoś pracę komentarzem: \`${milestone} — oddane do weryfikacji\` oraz \`Repo/branch: LOGIN_GITHUB\`.`;
+
+              } else if (
+                referenceDate ===
+                dateOffset(deadline, 1)
+              ) {
+
+                markerType =
+                  'AFTER-1';
+
+                if (milestone === 'M1') {
+
+                  reminderType =
+                    'uzupe\u0142nienie formalnego zg\u0142oszenia';
+
+                  message =
+                    'W ramach ' + milestone + ' cz\u0119\u015b\u0107 prac by\u0142a realizowana przed wprowadzeniem obecnego sposobu formalnego zg\u0142aszania kamieni milowych w GitHub Issues. ' +
+                    'Dla oznaczonych kont nie znaleziono jeszcze komentarza zgodnego z aktualnym standardem zg\u0142oszenia. ' +
+                    'Nie oznacza to automatycznie, \u017ce zadanie nie zosta\u0142o wykonane lub zosta\u0142o wykonane po terminie. ' +
+                    'Prosz\u0119 uzupe\u0142ni\u0107 formalne zg\u0142oszenie komentarzem: ' + milestone + ' \u2014 oddane do weryfikacji oraz Repo/branch: LOGIN_GITHUB. ' +
+                    'Data tego komentarza b\u0119dzie traktowana jako data formalizacji zg\u0142oszenia w nowym systemie. ' +
+                    'Wcze\u015bniejsza aktywno\u015b\u0107 projektowa i istniej\u0105ce artefakty b\u0119d\u0105 analizowane oddzielnie na podstawie historii repozytorium.';
+
+                } else {
+
+                  reminderType =
+                    '1 dzie\u0144 po terminie';
+
+                  message =
+                    'Termin kamienia milowego ' + milestone + ' min\u0105\u0142 ' + deadline + '. ' +
+                    'Nie znaleziono formalnego zg\u0142oszenia w GitHubie od oznaczonych os\u00f3b. ' +
+                    'Oznacza to brak dowodu formalnego oddania w GitHubie, a nie automatycznie brak wykonania pracy. ' +
+                    'Je\u015bli praca jest gotowa, zg\u0142o\u015b j\u0105 komentarzem: ' + milestone + ' \u2014 oddane do weryfikacji oraz Repo/branch: LOGIN_GITHUB.';
+
+                }
+
+              } else {
+
+                continue;
+              }
+
+              // ----------------------------------------------
+              // MARKER ANTY-SPAM
+              // ----------------------------------------------
+
+              const marker =
+                `<!-- ATINS-REMINDER-${milestone}-${markerType}-${deadline} -->`;
+
+              if (
+                comments.some(
+                  comment =>
+                    (comment.body || '')
+                      .includes(marker)
+                )
+              ) {
+
+                core.info(
+                  `Issue #${issue.number}: reminder already exists (${marker}).`
+                );
+
+                continue;
+              }
+
+              // ----------------------------------------------
+              // BODY
+              // ----------------------------------------------
+
+              const mentions =
+                pending
+                  .map(login => `@${login}`)
+                  .join(' ');
+
+              const notificationNote =
+                'GitHub wygeneruje powiadomienie zgodnie z ustawieniami konta; dostarczenie e-maila zależy od indywidualnych ustawień Notifications Studenta.';
+
+              const body = [
+                mentions,
+                '',
+                `## ${reminderType} — ${milestone}`,
+                '',
+                message,
+                '',
+                notificationNote,
+                '',
+                marker
+              ].join('\n');
+
+              let commentPosted = false;
+              let commentId = null;
+              let commentUrl = null;
+
+              // ----------------------------------------------
+              // DRY RUN / REAL
+              // ----------------------------------------------
+
+              if (dryRun) {
+
+                core.info(
+                  `[DRY RUN] Would comment on Issue #${issue.number}; pending: ${pending.join(', ')}; marker: ${marker}`
+                );
+
+              } else {
+
+                const result =
+                  await github.rest.issues.createComment(
+                    {
+                      owner: org,
+                      repo,
+                      issue_number: issue.number,
+                      body
+                    }
+                  );
+
+                commentPosted = true;
+                commentId = result.data.id;
+                commentUrl = result.data.html_url;
+
+                core.info(
+                  `Posted ${reminderType} reminder on Issue #${issue.number} for ${pending.length} student(s).`
+                );
+              }
+
+              auditSummary.reminders.push({
+                issue_number: issue.number,
+                issue_title: issue.title,
+                milestone,
+                deadline,
+                reminder_type: reminderType,
+                marker,
+                pending_count: pending.length,
+                pending_logins: pending,
+                comment_posted: commentPosted,
+                comment_id: commentId,
+                comment_url: commentUrl
+              });
+            }
+
+            // ------------------------------------------------
+            // ZAPIS PODSUMOWANIA DO PLIKU
+            // ------------------------------------------------
+
+            const summaryPath =
+              path.join(
+                process.env.GITHUB_WORKSPACE,
+                'notification-audit-summary.json'
+              );
+
+            fs.writeFileSync(
+              summaryPath,
+              JSON.stringify(
+                auditSummary,
+                null,
+                2
+              )
+            );
+
+            core.info(
+              `Checked ${milestoneIssues.length} open milestone issue(s), ` +
+              `${studentLogins.length} unique student(s), ` +
+              `reference date ${referenceDate}; dry run: ${dryRun}.`
+            );
+
+      - name: Upload notification audit summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: notification-audit-summary
+          path: notification-audit-summary.json
+          retention-days: 7
+
+
+  # ==========================================================
+  # JOB 2 — audyt mechanizmu powiadomień
+  # ==========================================================
+
+  notification-audit:
+    name: Kontrola powiadomień
+    needs: remind
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Download notification audit summary
+        uses: actions/download-artifact@v4
+        with:
+          name: notification-audit-summary
+
+      - name: Audit GitHub notification trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+
+            const org = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const summary =
+              JSON.parse(
+                fs.readFileSync(
+                  'notification-audit-summary.json',
+                  'utf8'
+                )
+              );
+
+            core.info(
+              `Reference date: ${summary.reference_date}`
+            );
+
+            core.info(
+              `Dry run: ${summary.dry_run}`
+            );
+
+            core.info(
+              `Roster size: ${summary.roster_size}`
+            );
+
+            core.info(
+              `Milestone issues checked: ${summary.issues_checked}`
+            );
+
+            if (
+              !Array.isArray(summary.reminders) ||
+              summary.reminders.length === 0
+            ) {
+
+              core.info(
+                'No reminder was scheduled for this reference date.'
+              );
+
+              core.info(
+                'GitHub notification trigger: NOT REQUIRED'
+              );
+
+              core.info(
+                'Email delivery: NOT VERIFIABLE'
+              );
+
+              return;
+            }
+
+            for (const reminder of summary.reminders) {
+
+              core.info(
+                '----------------------------------------'
+              );
+
+              core.info(
+                `Issue #${reminder.issue_number}`
+              );
+
+              core.info(
+                `Milestone: ${reminder.milestone}`
+              );
+
+              core.info(
+                `Deadline: ${reminder.deadline}`
+              );
+
+              core.info(
+                `Reminder type: ${reminder.reminder_type}`
+              );
+
+              core.info(
+                `Pending: ${reminder.pending_count}`
+              );
+
+              core.info(
+                `Pending logins: ${reminder.pending_logins.join(', ')}`
+              );
+
+              core.info(
+                `Marker: ${reminder.marker}`
+              );
+
+              // ----------------------------------------------
+              // DRY RUN
+              // ----------------------------------------------
+
+              if (summary.dry_run) {
+
+                core.info(
+                  'Comment posted: NO — DRY RUN'
+                );
+
+                core.info(
+                  'GitHub notification trigger: NOT SENT — DRY RUN'
+                );
+
+                core.info(
+                  'Email delivery: NOT VERIFIABLE'
+                );
+
+                continue;
+              }
+
+              // ----------------------------------------------
+              // REAL COMMENT
+              // ----------------------------------------------
+
+              if (
+                !reminder.comment_posted ||
+                !reminder.comment_id
+              ) {
+
+                core.setFailed(
+                  `Issue #${reminder.issue_number}: expected reminder comment was not recorded as posted.`
+                );
+
+                continue;
+              }
+
+              const response =
+                await github.rest.issues.getComment({
+                  owner: org,
+                  repo,
+                  comment_id: reminder.comment_id
+                });
+
+              const body =
+                response.data.body || '';
+
+              if (
+                !body.includes(
+                  reminder.marker
+                )
+              ) {
+
+                core.setFailed(
+                  `Issue #${reminder.issue_number}: reminder marker not found in posted comment.`
+                );
+
+                continue;
+              }
+
+              const missingMentions =
+                reminder.pending_logins.filter(
+                  login =>
+                    !body
+                      .toLowerCase()
+                      .includes(
+                        `@${login.toLowerCase()}`
+                      )
+                );
+
+              if (missingMentions.length > 0) {
+
+                core.setFailed(
+                  `Issue #${reminder.issue_number}: missing @mention(s): ${missingMentions.join(', ')}`
+                );
+
+                continue;
+              }
+
+              core.info(
+                `Comment posted: YES`
+              );
+
+              core.info(
+                `Comment ID: ${reminder.comment_id}`
+              );
+
+              core.info(
+                `Comment URL: ${reminder.comment_url}`
+              );
+
+              core.info(
+                `Verified mentions: ${reminder.pending_logins.length}`
+              );
+
+              core.info(
+                'GitHub notification trigger: CONFIRMED'
+              );
+
+              core.info(
+                'Email delivery: NOT VERIFIABLE'
+              );
+            }

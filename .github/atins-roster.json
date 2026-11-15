@@ -1,0 +1,57 @@
+﻿{
+    "instructor":  "RomanGrupaAF",
+    "TB":  [
+               "backend-dl",
+               "KornelJanczak",
+               "paweldali",
+               "sebeczeq",
+               "stawiarskii",
+               "TomBog181",
+               "mbaracz",
+               "rurzowagonska",
+               "Darcziks"
+           ],
+    "CHMURA":  [
+                   "adlbrtbsr",
+                   "annaguzowska",
+                   "jwasowicz",
+                   "kacstepi",
+                   "kamiloses",
+                   "laa66",
+                   "lukeDrozdovsky",
+                   "makszmijewski1",
+                   "MateuszGalusza",
+                   "s7801",
+                   "xiFPUEQk",
+                   "xsenon222",
+                   "jezthephilo",
+                   "HappySennin"
+               ],
+    "repositories":  {
+                         "jezthephilo":  "chmura-jezthephilo",
+                         "Darcziks":  "ATINS-Labs/tb-darcziks",
+                         "mbaracz":  "ATINS-Labs/tb-mbaracz",
+                         "rurzowagonska":  "ATINS-Labs/tb-rurzowagonska"
+                     },
+    "students":  [
+                     "adlbrtbsr",
+                     "annaguzowska",
+                     "backend-dl",
+                     "HappySennin",
+                     "jwasowicz",
+                     "kacstepi",
+                     "kamiloses",
+                     "KornelJanczak",
+                     "laa66",
+                     "lukeDrozdovsky",
+                     "makszmijewski1",
+                     "MateuszGalusza",
+                     "paweldali",
+                     "s7801",
+                     "sebeczeq",
+                     "stawiarskii",
+                     "TomBog181",
+                     "xiFPUEQk",
+                     "xsenon222"
+                 ]
+}

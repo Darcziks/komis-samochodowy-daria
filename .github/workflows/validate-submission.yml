@@ -1,0 +1,723 @@
+name: Validate student submission
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+  workflow_dispatch:
+    inputs:
+      student_login:
+        description: 'GitHub login studenta do testu'
+        required: true
+        type: string
+
+      repository:
+        description: 'Repozytorium w formacie OWNER/REPO'
+        required: true
+        type: string
+
+      branch:
+        description: 'Branch do sprawdzenia'
+        required: true
+        type: string
+        default: 'main'
+
+      milestone:
+        description: "Profil zg\u0142oszenia: M1, M2, TB lub ZPWC"
+        required: true
+        type: string
+        default: 'M1'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.issue.pull_request == null &&
+        github.event.comment.user.type != 'Bot'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate submission
+        id: validate
+        uses: actions/github-script@v7
+        env:
+          # For public repositories GITHUB_TOKEN is enough.
+          # For private student repositories use a PAT stored as ATINS_VALIDATOR_TOKEN.
+          VALIDATOR_TOKEN: ${{ secrets.ATINS_VALIDATOR_TOKEN }}
+          WORKFLOW_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const isManualTest = context.eventName === 'workflow_dispatch';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            let issue = context.payload.issue;
+            let comment = context.payload.comment;
+            let body = comment?.body || '';
+            let login = comment?.user?.login || '';
+            let milestone = '';
+            let repoOwner = '';
+            let repoName = '';
+            let branch = '';
+
+            const validationMarkerId = isManualTest
+              ? `TEST-${context.runId}`
+              : comment?.id;
+
+
+            const postValidationComment = async (responseBody) => {
+              if (isManualTest) {
+                core.info('[TEST MODE] Comment not posted.');
+                core.info(responseBody);
+                return;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: responseBody
+              });
+            };
+            if (isManualTest) {
+              login = String(context.payload.inputs?.student_login || '').trim();
+              milestone = String(context.payload.inputs?.milestone || 'M1').trim().toUpperCase();
+              branch = String(context.payload.inputs?.branch || 'main').trim();
+
+              const manualRepo = String(context.payload.inputs?.repository || '').trim();
+              const repoMatch = manualRepo.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+
+              if (!/^(?:M\d+|TB|ZPWC)$/i.test(milestone)) {
+                throw new Error(`Invalid profile "${milestone}". Expected M<number>, TB or ZPWC.`);
+              }
+              if (!login) {
+                throw new Error('student_login is required.');
+              }
+              if (!repoMatch) {
+                throw new Error('repository must use OWNER/REPO format.');
+              }
+              if (!branch) {
+                throw new Error('branch is required.');
+              }
+
+              repoOwner = repoMatch[1];
+              repoName = repoMatch[2];
+
+              core.info(
+                `[TEST MODE] ${login} -> ${repoOwner}/${repoName}@${branch}; milestone ${milestone}`
+              );
+            } else {
+              // Only milestone Issues, e.g. "M1 \u2014 ..."
+              const milestoneMatch = issue.title.match(/^((?:M\d+)|TB|ZPWC)\b/i);
+              if (!milestoneMatch) {
+                core.info('Not a milestone Issue; skipped.');
+                return;
+              }
+
+              milestone = milestoneMatch[1].toUpperCase();
+
+              // Only formal submission comments.
+              const submissionPattern = new RegExp(
+                `\\b${milestone}\\s*[\u2014-]\\s*(?:oddane do weryfikacji|aktualny stan pracy przes\u0142any)\\b`,
+                'i'
+              );
+
+              if (!submissionPattern.test(body)) {
+                core.info('Comment is not a formal milestone submission; skipped.');
+                return;
+              }
+
+              // Require explicit declaration that the instructor has repository access.
+              const accessDeclaration = body.match(
+                /Dost[e\u0119]p dla prowadz[a\u0105]cego:\s*(TAK|NIE)/i
+              );
+
+              if (!accessDeclaration) {
+              const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+              const response = [
+                `@${login} zg\u0142oszenie **${milestone}** wymaga uzupe\u0142nienia.`,
+                '',
+                'Brakuje deklaracji dost\u0119pu dla prowadz\u0105cego.',
+                '',
+                'U\u017Cyj formatu:',
+                `\`${milestone} \u2014 oddane do weryfikacji\``,
+                '`Repo/branch: OWNER/REPO \u2014 BRANCH`',
+                '`Dost\u0119p dla prowadz\u0105cego: TAK`',
+                '',
+                'Samo zg\u0142oszenie nie jest jeszcze potwierdzeniem dost\u0119pno\u015Bci artefaktu.',
+                '',
+                marker
+              ].join('\n');
+
+              await postValidationComment(response);
+
+              core.notice(`Submission from ${login}: access declaration missing.`);
+              return;
+            }
+
+            if (accessDeclaration[1].toUpperCase() !== 'TAK') {
+              const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+              const response = [
+                `@${login} zg\u0142oszenie **${milestone}** zosta\u0142o zapisane, ale artefakt nie jest jeszcze dost\u0119pny do weryfikacji.`,
+                '',
+                'W komentarzu wskazano: `Dost\u0119p dla prowadz\u0105cego: NIE`.',
+                '',
+                'Udost\u0119pnij repozytorium prowadz\u0105cemu, a nast\u0119pnie edytuj zg\u0142oszenie na:',
+                '`Dost\u0119p dla prowadz\u0105cego: TAK`',
+                '',
+                'Brak dost\u0119pu nie oznacza automatycznie braku wykonanej pracy \u2014 oznacza brak mo\u017Cliwo\u015Bci jej weryfikacji.',
+                '',
+                marker
+              ].join('\n');
+
+              await postValidationComment(response);
+
+              core.notice(`Submission from ${login}: instructor access declared as NO.`);
+              return;
+            }
+            }
+
+            // Load roster and confirm that the commenter is a student.
+            const rosterPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              '.github',
+              'atins-roster.json'
+            );
+
+            const rosterData = JSON.parse(
+              fs.readFileSync(rosterPath, 'utf8').replace(/^\uFEFF/, '')
+            );
+
+            const students = new Set(
+              (rosterData.students || [])
+                .filter(v => typeof v === 'string' && v.trim())
+                .map(v => v.trim().toLowerCase())
+            );
+
+            if (!isManualTest && !students.has(login.toLowerCase())) {
+              core.info(`${login} is not in the student roster; skipped.`);
+              return;
+            }
+
+            // ------------------------------------------------------------
+            // Parse repository / branch from known submission formats.
+            // Accepted examples:
+            // Repo/branch: owner/repo/main
+            // Repo/branch: owner/repo \u2014 main
+            // Repo/branch: owner/repo - main
+            // Repo/branch: repo-name/main
+            // Branch: branch-name
+            // URL may also be present: https://github.com/owner/repo
+            // ------------------------------------------------------------
+
+            if (!isManualTest) {
+            const githubUrl = body.match(
+              /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[\/\s]|$)/i
+            );
+
+            const repoBranchLine = body.match(
+              /Repo\/branch:\s*([^\r\n]+)/i
+            );
+
+            const branchOnly = body.match(
+              /(?:^|\n)\s*Branch:\s*([A-Za-z0-9._\/-]+)\s*(?:$|\n)/i
+            );
+
+            if (githubUrl) {
+              repoOwner = githubUrl[1];
+              repoName = githubUrl[2];
+            }
+
+            if (repoBranchLine) {
+              const raw = repoBranchLine[1]
+                .replace(/https?:\/\/github\.com\/\S+/ig, '')
+                .replace(/@[\w.-]+/g, '')
+                .trim();
+
+              // owner/repo \u2014 branch  OR owner/repo - branch
+              let m = raw.match(
+                /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\s*[\u2014-]\s*([A-Za-z0-9._\/-]+)$/
+              );
+              if (m) {
+                repoOwner ||= m[1];
+                repoName ||= m[2];
+                branch = m[3];
+              } else {
+                // owner/repo/branch
+                m = raw.match(
+                  /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9._\/-]+)$/
+                );
+                if (m) {
+                  repoOwner ||= m[1];
+                  repoName ||= m[2];
+                  branch = m[3];
+                } else {
+                  // repo/branch -> assume commenter owns repo
+                  m = raw.match(
+                    /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9._\/-]+)$/
+                  );
+                  if (m) {
+                    repoOwner ||= login;
+                    repoName ||= m[1];
+                    branch = m[2];
+                  }
+                }
+              }
+            }
+
+            if (!branch && branchOnly) {
+              branch = branchOnly[1];
+            }
+            }
+
+            // Legacy "Branch: LOGIN" without repository cannot be fully validated.
+            if (!repoName && branch) {
+              const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+              const response = [
+                `@${login} zg\u0142oszenie **${milestone}** zosta\u0142o zapisane, ale nie mog\u0119 jeszcze zweryfikowa\u0107 artefaktu.`,
+                '',
+                `Podano branch \`${branch}\`, ale nie podano repozytorium.`,
+                '',
+                'Prosz\u0119 uzupe\u0142ni\u0107 komentarz w formacie:',
+                `\`${milestone} \u2014 oddane do weryfikacji\``,
+                '`Repo/branch: OWNER/REPO \u2014 BRANCH`',
+                '',
+                'Je\u017Celi repozytorium jest prywatne, konto prowadz\u0105cego musi mie\u0107 do niego dost\u0119p.',
+                '',
+                marker
+              ].join('\n');
+
+              await postValidationComment(response);
+
+              core.notice(`Submission from ${login}: repository missing.`);
+              return;
+            }
+
+            if (!repoOwner || !repoName || !branch) {
+              const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+              const response = [
+                `@${login} zg\u0142oszenie **${milestone}** wymaga uzupe\u0142nienia.`,
+                '',
+                'Nie uda\u0142o si\u0119 jednoznacznie odczyta\u0107 repozytorium i brancha.',
+                '',
+                'U\u017Cyj formatu:',
+                `\`${milestone} \u2014 oddane do weryfikacji\``,
+                '`Repo/branch: OWNER/REPO \u2014 BRANCH`',
+                '',
+                marker
+              ].join('\n');
+
+              await postValidationComment(response);
+
+              core.notice(`Submission from ${login}: repo/branch could not be parsed.`);
+              return;
+            }
+
+            // ------------------------------------------------------------
+            // Cross-repository access
+            // ------------------------------------------------------------
+            const validatorToken = process.env.VALIDATOR_TOKEN?.trim();
+            const workflowToken = process.env.WORKFLOW_TOKEN?.trim();
+
+            const isCurrentRepository =
+              repoOwner.toLowerCase() === owner.toLowerCase() &&
+              repoName.toLowerCase() === repo.toLowerCase();
+
+            const effectiveToken = isCurrentRepository
+              ? workflowToken
+              : validatorToken;
+            if (!validatorToken) {
+              core.notice(
+                'ATINS_VALIDATOR_TOKEN is not configured. Private repositories outside this repository may return ACCESS_REQUIRED.'
+              );
+            }
+
+            // Use direct GitHub REST requests with the validator PAT.
+            // This avoids github-script's authenticated Octokit client
+            // rewriting or retaining the workflow GITHUB_TOKEN.
+            const validatorRequest = async (route, params = {}) => {
+              const [method, routePath] = route.split(/\s+/, 2);
+
+              const endpoint = routePath
+                .replace('{owner}', encodeURIComponent(params.owner || ''))
+                .replace('{repo}', encodeURIComponent(params.repo || ''))
+                .replace('{branch}', encodeURIComponent(params.branch || ''));
+
+              const url = `https://api.github.com${endpoint}`;
+              const headers = {
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+                'User-Agent': 'ATINS-submission-validator'
+              };
+
+              if (effectiveToken) {
+                headers['Authorization'] = `Bearer ${effectiveToken}`;
+              }
+
+              const response = await fetch(url, {
+                method,
+                headers
+              });
+
+              if (!response.ok) {
+                const error = new Error(
+                  `GitHub API request failed: ${response.status} ${response.statusText}`
+                );
+                error.status = response.status;
+                throw error;
+              }
+
+              return {
+                data: await response.json()
+              };
+            };
+
+            let repository;
+            try {
+              const result = await validatorRequest(
+                'GET /repos/{owner}/{repo}',
+                {
+                  owner: repoOwner,
+                  repo: repoName
+                }
+              );
+              repository = result.data;
+            } catch (error) {
+              if (error.status === 404 || error.status === 403) {
+                const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+                const response = [
+                  `@${login} zg\u0142oszenie **${milestone}** zosta\u0142o zapisane, ale repozytorium nie jest dost\u0119pne do weryfikacji.`,
+                  '',
+                  `Repo: \`${repoOwner}/${repoName}\``,
+                  `Branch: \`${branch}\``,
+                  '',
+                  'Sprawd\u017A, czy repozytorium istnieje i czy konto prowadz\u0105cego ma do niego dost\u0119p.',
+                  'Je\u017Celi repo jest prywatne, udost\u0119pnij je prowadz\u0105cemu, a nast\u0119pnie pon\u00F3w lub edytuj zg\u0142oszenie.',
+                  '',
+                  'Status techniczny: `ACCESS_REQUIRED`',
+                  '',
+                  'Brak dost\u0119pu do repozytorium nie oznacza automatycznie braku wykonanej pracy \u2014 oznacza brak mo\u017Cliwo\u015Bci weryfikacji artefaktu.',
+                  '',
+                  marker
+                ].join('\n');
+
+                await postValidationComment(response);
+
+                core.notice(`Submission from ${login}: repository inaccessible.`);
+                return;
+              }
+              throw error;
+            }
+
+            // Branch exists?
+            try {
+              await validatorRequest(
+                'GET /repos/{owner}/{repo}/branches/{branch}',
+                {
+                  owner: repoOwner,
+                  repo: repoName,
+                  branch
+                }
+              );
+            } catch (error) {
+              if (error.status === 404) {
+                const marker = `<!-- ATINS-SUBMISSION-VALIDATION-${validationMarkerId} -->`;
+                const response = [
+                  `@${login} repozytorium jest dost\u0119pne, ale wskazany branch nie zosta\u0142 znaleziony.`,
+                  '',
+                  `Repo: \`${repoOwner}/${repoName}\``,
+                  `Branch: \`${branch}\``,
+                  '',
+                  'Status techniczny: `BRANCH_NOT_FOUND`',
+                  '',
+                  'Sprawd\u017A nazw\u0119 brancha i edytuj komentarz ze zg\u0142oszeniem.',
+                  '',
+                  marker
+                ].join('\n');
+
+                await postValidationComment(response);
+
+                core.notice(`Submission from ${login}: branch not found.`);
+                return;
+              }
+              throw error;
+            }
+
+            // Get branch head and at least one commit.
+            const branchData = await validatorRequest(
+              'GET /repos/{owner}/{repo}/branches/{branch}',
+              {
+                owner: repoOwner,
+                repo: repoName,
+                branch
+              }
+            );
+
+            const headSha = branchData.data.commit.sha;
+
+
+            core.setOutput('ready', 'true');
+
+            core.setOutput('milestone', milestone);
+
+            core.setOutput('student_login', login);
+
+            core.setOutput('repo_owner', repoOwner);
+
+            core.setOutput('repo_name', repoName);
+
+            core.setOutput('branch', branch);
+
+            core.setOutput('head_sha', headSha);
+            // Success: artefact is reachable.
+            const marker = [
+              '<!-- ATINS-READY-FOR-REVIEW',
+              `student=${login}`,
+              `milestone=${milestone}`,
+              `repo=${repoOwner}/${repoName}`,
+              `branch=${branch}`,
+              `head=${headSha.slice(0, 7)}`,
+              `submissionIssue=${issue?.number || ''}`,
+              '-->'
+            ].join(' ');
+            const response = [
+              `@${login} \u2705 zg\u0142oszenie **${milestone}** jest technicznie dost\u0119pne do weryfikacji.`,
+              '',
+              `Repo: \`${repoOwner}/${repoName}\``,
+              `Branch: \`${branch}\``,
+              `HEAD: \`${headSha.slice(0, 7)}\``,
+              `Widoczno\u015B\u0107 repo: \`${repository.private ? 'private' : 'public'}\``,
+              '',
+              'Status techniczny: `READY_FOR_REVIEW`',
+              '',
+              'To potwierdza dost\u0119pno\u015B\u0107 artefaktu. Nie jest to jeszcze ocena jako\u015Bci ani kompletno\u015Bci zg\u0142oszenia.',
+              '',
+              marker
+            ].join('\n');
+
+            await postValidationComment(response);
+
+            core.notice(
+              `Validated submission: ${login} -> ${repoOwner}/${repoName}@${branch}`
+            );
+
+            if (isManualTest) {
+              await core.summary
+                .addHeading('Submission validation test')
+                .addRaw(`Student: ${login}\n`)
+                .addRaw(`Milestone: ${milestone}\n`)
+                .addRaw(`Repo: ${repoOwner}/${repoName}\n`)
+                .addRaw(`Branch: ${branch}\n`)
+                .addRaw(`HEAD: ${headSha.slice(0, 7)}\n`)
+                .addRaw(`Visibility: ${repository.private ? 'private' : 'public'}\n`)
+                .addRaw('Status: READY_FOR_REVIEW\n')
+                .write();
+            }
+
+      - name: Checkout student repository for TB/ZPWC
+        if: >
+          steps.validate.outputs.ready == 'true' &&
+          (
+            steps.validate.outputs.milestone == 'TB' ||
+            steps.validate.outputs.milestone == 'ZPWC'
+          )
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.validate.outputs.repo_owner }}/${{ steps.validate.outputs.repo_name }}
+          ref: ${{ steps.validate.outputs.head_sha }}
+          token: ${{ steps.validate.outputs.repo_owner == github.repository_owner && steps.validate.outputs.repo_name == github.event.repository.name && secrets.GITHUB_TOKEN || secrets.ATINS_VALIDATOR_TOKEN }}
+          path: student-repo
+
+      - name: Install student dependencies for TB/ZPWC
+        if: >
+          steps.validate.outputs.ready == 'true' &&
+          (
+            steps.validate.outputs.milestone == 'TB' ||
+            steps.validate.outputs.milestone == 'ZPWC'
+          ) &&
+          hashFiles('student-repo/package-lock.json') != ''
+        working-directory: student-repo
+        run: npm ci --ignore-scripts
+
+      - name: Run TB precheck
+        if: >
+          steps.validate.outputs.ready == 'true' &&
+          steps.validate.outputs.milestone == 'TB'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/tools/ATINS-Prepare-TB.ps1" `
+            -RepoPath "$env:GITHUB_WORKSPACE/student-repo"
+
+      - name: Run ZPWC precheck
+        if: >
+          steps.validate.outputs.ready == 'true' &&
+          steps.validate.outputs.milestone == 'ZPWC'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/tools/ATINS-Prepare-ZPWC.ps1" `
+            -RepoPath "$env:GITHUB_WORKSPACE/student-repo"
+
+      - name: Publish TB precheck to issue
+        if: >
+          github.event_name == 'issue_comment' &&
+          steps.validate.outputs.ready == 'true' &&
+          steps.validate.outputs.milestone == 'TB'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const issueNumber = context.issue.number;
+            const student = '${{ steps.validate.outputs.student_login }}';
+            const head = '${{ steps.validate.outputs.head_sha }}'.slice(0, 7);
+
+            const reportPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              'reports',
+              'student-repo',
+              '_ATINS_PRECHECK_TB.txt'
+            );
+
+            if (!fs.existsSync(reportPath)) {
+              core.setFailed(`TB report not found: ${reportPath}`);
+              return;
+            }
+
+            const report = fs.readFileSync(reportPath, 'utf8');
+            const marker = `<!-- ATINS-TB-PRECHECK issue=${issueNumber} -->`;
+
+            const body = [
+              marker,
+              `@${student} wynik technicznego prechecku **TB** dla HEAD \`${head}\`:`,
+              '',
+              '```text',
+              report.trim(),
+              '```',
+              '',
+              'To jest automatyczny precheck techniczny. Wymaga weryfikacji prowadzącego.'
+            ].join('\n');
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100
+              }
+            );
+
+            const existing = comments.find(
+              c => typeof c.body === 'string' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+
+              core.notice(`Updated TB precheck comment on issue #${issueNumber}.`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body
+              });
+
+              core.notice(`Published TB precheck to issue #${issueNumber}.`);
+            }
+
+      - name: Publish ZPWC precheck to issue
+        if: >
+          github.event_name == 'issue_comment' &&
+          steps.validate.outputs.ready == 'true' &&
+          steps.validate.outputs.milestone == 'ZPWC'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const issueNumber = context.issue.number;
+            const student = '${{ steps.validate.outputs.student_login }}';
+            const head = '${{ steps.validate.outputs.head_sha }}'.slice(0, 7);
+
+            const reportPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              'reports',
+              'student-repo',
+              '_ATINS_PRECHECK_ZPWC_COMBINED.txt'
+            );
+
+            if (!fs.existsSync(reportPath)) {
+              core.setFailed(`ZPWC combined report not found: ${reportPath}`);
+              return;
+            }
+
+            const report = fs.readFileSync(reportPath, 'utf8');
+            const marker = `<!-- ATINS-ZPWC-PRECHECK issue=${issueNumber} -->`;
+
+            const body = [
+              marker,
+              `@${student} wynik technicznego prechecku **ZPWC** dla HEAD \`${head}\`:`,
+              '',
+              '```text',
+              report.trim(),
+              '```',
+              '',
+              'To jest automatyczny precheck techniczny. Wymaga weryfikacji prowadzącego.'
+            ].join('\n');
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100
+              }
+            );
+
+            const existing = comments.find(
+              c => typeof c.body === 'string' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+
+              core.notice(`Updated ZPWC precheck comment on issue #${issueNumber}.`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body
+              });
+
+              core.notice(`Published ZPWC precheck to issue #${issueNumber}.`);
+            }

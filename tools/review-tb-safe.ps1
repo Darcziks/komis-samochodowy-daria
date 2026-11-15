@@ -1,0 +1,376 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepoPath
+)
+
+$ErrorActionPreference = "Stop"
+
+function Add-Finding {
+    param(
+        [string]$Area,
+        [ValidateSet("PASS","WARN","FAIL","INFO")]
+        [string]$Status,
+        [string]$Observation,
+        [string]$Evidence
+    )
+
+    $script:Findings += [PSCustomObject]@{
+        Area        = $Area
+        Status      = $Status
+        Observation = $Observation
+        Evidence    = $Evidence
+    }
+}
+
+function Read-TextSafe {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return ""
+    }
+
+    $value = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+
+    if ($null -eq $value) {
+        return ""
+    }
+
+    return [string]$value
+}
+
+if (-not (Test-Path $RepoPath)) {
+    throw "Repository not found: $RepoPath"
+}
+
+if (-not (Test-Path (Join-Path $RepoPath ".git"))) {
+    throw "Path is not a Git repository: $RepoPath"
+}
+
+$Findings = @()
+
+Write-Host ""
+Write-Host "=== ATINS TB PRECHECK SAFE ==="
+Write-Host "Repo: $RepoPath"
+Write-Host ""
+
+$branchRaw = git -C $RepoPath branch --show-current 2>$null
+$headRaw = git -C $RepoPath rev-parse --short HEAD 2>$null
+$tracked = @(git -C $RepoPath ls-tree -r --name-only HEAD)
+
+$branch = if ([string]::IsNullOrWhiteSpace([string]$branchRaw)) {
+    "detached HEAD"
+}
+else {
+    [string]$branchRaw
+}
+
+if ([string]::IsNullOrWhiteSpace([string]$headRaw)) {
+    throw "Cannot determine repository HEAD."
+}
+
+$head = [string]$headRaw
+
+Add-Finding "Git" "INFO" "Audited repository state" "branch=$branch; HEAD=$head"
+
+# ------------------------------------------------------------
+# REQUIRED FILES
+# ------------------------------------------------------------
+foreach ($required in @(".env.example", "package.json", "README_AUDIT.md")) {
+    if (Test-Path (Join-Path $RepoPath $required)) {
+        Add-Finding "Required file" "PASS" "File exists" $required
+    }
+    else {
+        Add-Finding "Required file" "FAIL" "Required file missing" $required
+    }
+}
+
+# ------------------------------------------------------------
+# FORBIDDEN TRACKED FILES
+# ------------------------------------------------------------
+$forbidden = @(
+    $tracked | Where-Object {
+        $_ -eq ".env" -or
+        $_ -eq ".env.local" -or
+        $_ -like "node_modules/*"
+    }
+)
+
+if ($forbidden.Count -eq 0) {
+    Add-Finding "Secrets / tracked files" "PASS" "No forbidden tracked files detected" "Static Git check"
+}
+else {
+    Add-Finding "Secrets / tracked files" "FAIL" "Forbidden tracked files detected" ($forbidden -join ", ")
+}
+
+# ------------------------------------------------------------
+# CODE INVENTORY
+# ------------------------------------------------------------
+$codeFiles = @(
+    $tracked | Where-Object {
+        $_ -match "\.(js|mjs|cjs|ts|jsx|tsx)$"
+    }
+)
+
+$backendFiles = @()
+$backendContent = ""
+
+foreach ($relative in $codeFiles) {
+    $full = Join-Path $RepoPath $relative
+    $content = Read-TextSafe -Path $full
+
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        continue
+    }
+
+    $looksLikeBackendPath =
+        $relative -match "(?i)(^|/)(api|routes|server|backend)(/|$)" -or
+        $relative -match "(?i)(route|router|server|api)\.(js|ts|mjs|cjs)$"
+
+    $looksLikeBackendCode =
+        $content -match "(?i)\bapp\.(get|post|put|patch|delete)\s*\(" -or
+        $content -match "(?i)\brouter\.(get|post|put|patch|delete)\s*\(" -or
+        $content -match "(?i)export\s+async\s+function\s+(GET|POST|PUT|PATCH|DELETE)\b" -or
+        $content -match "(?i)\bfetch\s*\(" -or
+        $content -match "(?i)\bResponse\.json\s*\(" -or
+        $content -match "(?i)\bNextResponse\.json\s*\("
+
+    if ($looksLikeBackendPath -or $looksLikeBackendCode) {
+        $backendFiles += $relative
+        $backendContent += "`n" + $content
+    }
+}
+
+if ($backendFiles.Count -gt 0) {
+    Add-Finding "TB backend" "PASS" "Backend implementation detected" (($backendFiles | Select-Object -Unique) -join ", ")
+}
+else {
+    Add-Finding "TB backend" "FAIL" "Backend implementation not detected" "No API/backend evidence"
+}
+
+# ------------------------------------------------------------
+# HTTP CONTRACT
+# ------------------------------------------------------------
+$hasHttpMethod =
+    $backendContent -match "(?i)\b(GET|POST|PUT|PATCH|DELETE)\b" -or
+    $backendContent -match "(?i)\.(get|post|put|patch|delete)\s*\("
+
+$hasHttpPath =
+    $backendContent -match "(?i)['""]/[^'""]+['""]"
+
+$fileRouteEvidence = @()
+
+foreach ($relative in $backendFiles) {
+    $full = Join-Path $RepoPath $relative
+    $content = Read-TextSafe -Path $full
+
+    if (
+        $relative -match "(?i)^api/.+\.(js|ts|mjs|cjs)$" -and
+        $content -match "(?i)export\s+async\s+function\s+(GET|POST|PUT|PATCH|DELETE)\b"
+    ) {
+        $route = "/" + ($relative -replace "\\","/" -replace "\.(js|ts|mjs|cjs)$","")
+        $fileRouteEvidence += $route
+    }
+}
+
+if ($hasHttpMethod -and $hasHttpPath) {
+    Add-Finding "TB HTTP contract" "PASS" "Explicit HTTP method and path detected" "Static backend inspection"
+}
+elseif ($fileRouteEvidence.Count -gt 0) {
+    Add-Finding "TB HTTP contract" "PASS" "File-based HTTP route detected" ($fileRouteEvidence -join ", ")
+}
+elseif ($backendFiles.Count -gt 0) {
+    Add-Finding "TB HTTP contract" "WARN" "HTTP contract not explicit enough" "Verify method and path manually"
+}
+else {
+    Add-Finding "TB HTTP contract" "INFO" "No backend available for contract inspection" "No further inference"
+}
+
+# ------------------------------------------------------------
+# EXTERNAL SERVICE INTEGRATION
+# ------------------------------------------------------------
+$hasExternalIntegration =
+    $backendContent -match "(?i)\bfetch\s*\(" -or
+    $backendContent -match "(?i)\baxios\b" -or
+    $backendContent -match "(?i)\bgenerateText\s*\(" -or
+    $backendContent -match "(?i)@ai-sdk/" -or
+    $backendContent -match "(?i)\bhttps?://"
+
+if ($hasExternalIntegration) {
+    Add-Finding "TB external service" "PASS" "External service integration evidence detected" "Static backend inspection"
+}
+elseif ($backendFiles.Count -gt 0) {
+    Add-Finding "TB external service" "WARN" "No clear external service integration detected" "Verify implementation manually"
+}
+else {
+    Add-Finding "TB external service" "INFO" "No backend available for integration inspection" "No further inference"
+}
+
+# ------------------------------------------------------------
+# README_AUDIT
+# ------------------------------------------------------------
+$readmePath = Join-Path $RepoPath "README_AUDIT.md"
+
+if (Test-Path $readmePath) {
+    $readme = Read-TextSafe -Path $readmePath
+
+    $auditElements = @(
+        "cel",
+        "uruchom",
+        "test",
+        "wynik",
+        "ogranic"
+    )
+
+    $missingAudit = @(
+        $auditElements | Where-Object {
+            $readme -notmatch "(?i)$([regex]::Escape($_))"
+        }
+    )
+
+    if ($missingAudit.Count -eq 0) {
+        Add-Finding "README_AUDIT" "PASS" "Expected audit sections detected" "goal/run/test/result/limitations"
+    }
+    else {
+        Add-Finding "README_AUDIT" "WARN" "Audit README may be incomplete" ("Missing evidence: " + ($missingAudit -join ", "))
+    }
+}
+
+# ------------------------------------------------------------
+# POSTMAN - OPTIONAL
+# ------------------------------------------------------------
+$postmanFiles = @(
+    $tracked | Where-Object {
+        $_ -match "(?i)postman.*\.json$|.*collection.*\.json$"
+    }
+)
+
+if ($postmanFiles.Count -gt 0) {
+    Add-Finding "Postman" "PASS" "Postman evidence detected" ($postmanFiles -join ", ")
+}
+else {
+    Add-Finding "Postman" "INFO" "No Postman collection detected" "Optional evidence in TB profile"
+}
+
+# ------------------------------------------------------------
+# TESTS
+# ------------------------------------------------------------
+$testFiles = @(
+    $tracked | Where-Object {
+        $_ -match "(?i)(^|/)(tests?|__tests__)(/|$)" -or
+        $_ -match "(?i)\.(test|spec)\.(js|ts|mjs|cjs)$"
+    }
+)
+
+if ($testFiles.Count -gt 0) {
+    Add-Finding "Tests" "PASS" "Test files detected" ($testFiles -join ", ")
+}
+else {
+    Add-Finding "Tests" "WARN" "No test files detected" "Verify testing evidence"
+}
+
+# ------------------------------------------------------------
+# NPM CHECKS
+# ------------------------------------------------------------
+$packagePath = Join-Path $RepoPath "package.json"
+
+if (Test-Path $packagePath) {
+    try {
+        $package = (Read-TextSafe -Path $packagePath) | ConvertFrom-Json
+        $scriptNames = @()
+
+        if ($null -ne $package.scripts) {
+            $scriptNames = @($package.scripts.PSObject.Properties.Name)
+        }
+
+        foreach ($expected in @("check:syntax", "typecheck")) {
+            if ($scriptNames -notcontains $expected) {
+                Add-Finding "npm:$expected" "WARN" "Script not defined" "package.json"
+                continue
+            }
+
+            $output = @(
+                & $(if ($IsWindows) { "npm.cmd" } else { "npm" }) --prefix $RepoPath run $expected 2>&1
+            )
+
+            $exitCode = $LASTEXITCODE
+
+            if ($exitCode -eq 0) {
+                Add-Finding "npm:$expected" "PASS" "Script completed successfully" "ExitCode=0"
+            }
+            else {
+                Add-Finding "npm:$expected" "FAIL" "Script failed" "ExitCode=$exitCode"
+            }
+        }
+    }
+    catch {
+        Add-Finding "package.json" "FAIL" "Cannot process package.json" $_.Exception.Message
+    }
+}
+
+# ------------------------------------------------------------
+# SECURITY HEURISTICS
+# ------------------------------------------------------------
+$allCode = ""
+
+foreach ($relative in $codeFiles) {
+    $allCode += "`n" + (Read-TextSafe -Path (Join-Path $RepoPath $relative))
+}
+
+if ($allCode -match "(?i)console\.log\s*\([^)]*(API_KEY|TOKEN|PASSWORD|DATABASE_URL)") {
+    Add-Finding "Security logging" "FAIL" "Possible secret logging detected" "Static heuristic"
+}
+else {
+    Add-Finding "Security logging" "PASS" "No obvious secret logging detected" "Static heuristic"
+}
+
+if ($allCode -match "(?i)postgres(ql)?://[^'""\s]+") {
+    Add-Finding "Security secrets" "FAIL" "Possible PostgreSQL connection string in code" "Static heuristic"
+}
+else {
+    Add-Finding "Security secrets" "PASS" "No obvious PostgreSQL connection string detected" "Static heuristic"
+}
+
+# ------------------------------------------------------------
+# OUTPUT
+# ------------------------------------------------------------
+Write-Host ""
+$Findings | Format-Table -AutoSize -Wrap
+
+$passCount = @($Findings | Where-Object Status -eq "PASS").Count
+$warnCount = @($Findings | Where-Object Status -eq "WARN").Count
+$failCount = @($Findings | Where-Object Status -eq "FAIL").Count
+$infoCount = @($Findings | Where-Object Status -eq "INFO").Count
+
+Write-Host ""
+Write-Host "PASS: $passCount | WARN: $warnCount | FAIL: $failCount | INFO: $infoCount"
+Write-Host ""
+Write-Host "SAFE MODE:"
+Write-Host "- no student secrets are read"
+Write-Host "- no database connection is executed"
+Write-Host "- external services are not called"
+Write-Host "- findings require instructor verification"
+
+$repoName = Split-Path $RepoPath -Leaf
+$toolsRoot = Split-Path $PSScriptRoot -Parent
+$reportDir = Join-Path (Join-Path $toolsRoot "reports") $repoName
+
+if (-not (Test-Path $reportDir)) {
+    New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+}
+
+$reportPath = Join-Path $reportDir "_ATINS_PRECHECK_TB.txt"
+
+@(
+    "ATINS TB PRECHECK SAFE"
+    "Repo: $RepoPath"
+    "Branch: $branch"
+    "HEAD: $head"
+    ""
+    ($Findings | Format-Table -AutoSize -Wrap | Out-String)
+    "PASS: $passCount | WARN: $warnCount | FAIL: $failCount | INFO: $infoCount"
+    ""
+    "Static technical precheck. Instructor verification required."
+) | Set-Content -Path $reportPath -Encoding UTF8
+
+Write-Host ""
+Write-Host "Report: $reportPath"

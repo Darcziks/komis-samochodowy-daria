@@ -1,0 +1,156 @@
+﻿name: Publish student roadmaps
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/materials/TB/ROADMAP.md"
+      - ".github/materials/CHMURA/ROADMAP.md"
+      - ".github/atins-roster.json"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+
+      - name: Verify GitHub token
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.ATINS_VALIDATOR_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "ATINS_VALIDATOR_TOKEN_IS_EMPTY"
+          }
+
+          Write-Host "ATINS_VALIDATOR_TOKEN=AVAILABLE"
+
+          gh api user --jq '.login'
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ATINS_VALIDATOR_TOKEN_INVALID"
+          }
+
+      - name: Publish ROADMAP to assigned student repositories
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.ATINS_VALIDATOR_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $roster = Get-Content ".github/atins-roster.json" -Raw | ConvertFrom-Json
+
+          function Get-RepositoryForLogin {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Login
+            )
+
+            if (-not $roster.PSObject.Properties["repositories"]) {
+              return $null
+            }
+
+            $property = $roster.repositories.PSObject.Properties[$Login]
+
+            if (-not $property) {
+              return $null
+            }
+
+            return [string]$property.Value
+          }
+
+          function Publish-Roadmap {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Login,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Group,
+
+              [Parameter(Mandatory = $true)]
+              [string]$SourceFile
+            )
+
+            $repoName = Get-RepositoryForLogin -Login $Login
+
+            if ([string]::IsNullOrWhiteSpace($repoName)) {
+              Write-Host "SKIP: brak repo dla $Login"
+              return
+            }
+
+            $targetRepo = if ($repoName -match "/") {
+              $repoName
+            }
+            else {
+              "ATINS-Labs/$repoName"
+            }
+
+            $targetPath = ".github/materials/ROADMAP.md"
+
+            Write-Host "GROUP=$Group"
+            Write-Host "STUDENT=$Login"
+            Write-Host "TARGET=$targetRepo"
+
+            $roadmapText = Get-Content $SourceFile -Raw
+            $contentBytes = [Text.Encoding]::UTF8.GetBytes($roadmapText)
+            $contentBase64 = [Convert]::ToBase64String($contentBytes)
+
+            $existingJson = gh api `
+              "repos/$targetRepo/contents/$targetPath" 2>$null
+
+            if ($LASTEXITCODE -eq 0 -and $existingJson) {
+              $existing = $existingJson | ConvertFrom-Json
+            }
+            else {
+              $existing = $null
+            }
+
+            $body = @{
+              message = "docs: update student roadmap"
+              content = $contentBase64
+            }
+
+            if ($existing -and $existing.sha) {
+              $body.sha = $existing.sha
+            }
+
+            $tempFile = Join-Path `
+              $env:RUNNER_TEMP `
+              ("roadmap-" + $Login + ".json")
+
+            $body |
+              ConvertTo-Json -Depth 5 |
+              Set-Content $tempFile -Encoding utf8
+
+            gh api `
+              --method PUT `
+              "repos/$targetRepo/contents/$targetPath" `
+              --input $tempFile
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "ROADMAP_PUBLISH_FAILED: $targetRepo"
+            }
+
+            Write-Host "ROADMAP_PUBLISH=PASS"
+          }
+
+          foreach ($login in $roster.TB) {
+            Publish-Roadmap `
+              -Login $login `
+              -Group "TB" `
+              -SourceFile ".github/materials/TB/ROADMAP.md"
+          }
+
+          foreach ($login in $roster.CHMURA) {
+            Publish-Roadmap `
+              -Login $login `
+              -Group "CHMURA" `
+              -SourceFile ".github/materials/CHMURA/ROADMAP.md"
+          }
